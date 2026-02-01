@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 import json
 import os
-import gdown
+
 
 st.set_page_config(
     page_title="Leaf Disease Detection",
@@ -24,7 +24,7 @@ st.set_page_config(
 def load_disease_model():
     """Load trained Random Forest model and feature extractor"""
     
-    
+    import gdown
     model_path = "models/final_leaf_disease_model.joblib"
     metadata_options = ["data/metadata.json", "results/metadata.json", "models/metadata.json"]
     
