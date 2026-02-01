@@ -1,0 +1,10 @@
+streamlit==1.38.0
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+joblib==1.4.2
+numpy==2.1.1
+pandas==2.2.2
+Pillow==10.4.0
+scikit-learn==1.5.1
+gdown==5.2.0

@@ -1,0 +1,4 @@
+__pycache__/
+.streamlit/
+.env
+.DS_Store
