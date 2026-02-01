@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 import json
 import os
+import gdown
 
 st.set_page_config(
     page_title="Leaf Disease Detection",
@@ -21,12 +22,18 @@ st.set_page_config(
 
 @st.cache_resource
 def load_disease_model():
+    """Load trained Random Forest model and feature extractor"""
+    
+    
     model_path = "models/final_leaf_disease_model.joblib"
     metadata_options = ["data/metadata.json", "results/metadata.json", "models/metadata.json"]
     
     if not os.path.exists(model_path):
-        st.error(f"❌ Model not found at: `{model_path}`")
-        st.stop()
+        with st.spinner("📥 Downloading model (2.3GB, first time only)..."):
+            os.makedirs("models", exist_ok=True)
+            model_url = "https://drive.google.com/uc?id=1vdGvyehvrAWtvVTWM9G0Dq-sQh13Sp2k&export=download"
+            gdown.download(model_url, model_path, quiet=False)
+        st.success("✅ Model downloaded!")
 
     try:
         rf_model = load(model_path)
