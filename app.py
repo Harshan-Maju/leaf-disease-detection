@@ -1,40 +1,38 @@
 import streamlit as st
-import gdown
 import os
 import json
-import torch
-from torchvision import transforms
+import joblib
 from PIL import Image
+import numpy as np
 import zipfile
+import gdown
 
 # ------------------------------
 # --- CONFIGURATION / PATHS ---
 # ------------------------------
 os.makedirs("models", exist_ok=True)
 
-MODEL_PATH = "models/leaf_model.pth"
-MODEL_URL = "https://drive.google.com/uc?export=download&id=1vdGvyehvrAWtvVTWM9G0Dq-sQh13Sp2k"
+# Models (joblib)
+MODEL_PATH = "models/final_leaf_disease_model.joblib"
+PCA_PATH = "models/pca.joblib"  # optional if your pipeline needs PCA
+PIPELINE_PATH = "models/production_pipeline.joblib"  # optional
 
+# Metadata
 METADATA_PATH = "models/metadata.json"
 METADATA_URL = "https://drive.google.com/uc?export=download&id=17QTd2spFzpcwX6o256Xegqjksvl5zI6t"
 
 # ------------------------------
-# --- DOWNLOAD FUNCTION ---
+# --- DOWNLOAD METADATA IF MISSING ---
 # ------------------------------
 def download_file(url, path, description):
     if not os.path.exists(path):
-        try:
-            with st.spinner(f"📥 Downloading {description}..."):
-                gdown.download(url, path, quiet=False)
-        except Exception as e:
-            st.error(f"Failed to download {description}. Please download manually.\n{e}")
-            st.stop()
+        with st.spinner(f"📥 Downloading {description}..."):
+            gdown.download(url, path, quiet=False)
 
-download_file(MODEL_URL, MODEL_PATH, "model")
 download_file(METADATA_URL, METADATA_PATH, "metadata")
 
 # ------------------------------
-# --- LOAD METADATA & MODEL ---
+# --- LOAD METADATA ---
 # ------------------------------
 with open(METADATA_PATH, "r") as f:
     metadata = json.load(f)
@@ -45,38 +43,52 @@ if "class_to_idx" not in metadata:
 
 class_names = {v: k for k, v in metadata["class_to_idx"].items()}
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = torch.load(MODEL_PATH, map_location=device)
-model.eval()
+# ------------------------------
+# --- LOAD MODEL ---
+# ------------------------------
+if not os.path.exists(MODEL_PATH):
+    st.error(f"Model file {MODEL_PATH} not found. Please upload it.")
+    st.stop()
+
+model = joblib.load(MODEL_PATH)
+st.success("✅ Model loaded successfully!")
+
+# Optional: load PCA or pipeline if used
+# pca = joblib.load(PCA_PATH) if os.path.exists(PCA_PATH) else None
+# pipeline = joblib.load(PIPELINE_PATH) if os.path.exists(PIPELINE_PATH) else None
 
 # ------------------------------
-# --- IMAGE TRANSFORMS ---
+# --- IMAGE PREPROCESSING ---
 # ------------------------------
-image_transforms = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+def preprocess_image(image: Image.Image) -> np.ndarray:
+    """
+    Converts a PIL image into the format your joblib model expects.
+    For example, flatten and normalize.
+    Adjust this function based on your model's training pipeline.
+    """
+    image = image.resize((224, 224))  # or your trained size
+    arr = np.array(image).astype(np.float32)
+    arr = arr.flatten()  # flatten image
+    arr = arr.reshape(1, -1)
+    return arr
 
 # ------------------------------
 # --- PREDICTION FUNCTION ---
 # ------------------------------
-def predict_image(image):
-    img = image_transforms(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        outputs = model(img)
-        _, pred_idx = torch.max(outputs, 1)
-    return class_names[int(pred_idx)]
+def predict_image(image: Image.Image):
+    X = preprocess_image(image)
+    pred_idx = model.predict(X)[0]
+    # Map prediction index to class name
+    return class_names.get(pred_idx, f"Class {pred_idx}")
 
 # ------------------------------
 # --- STREAMLIT UI ---
 # ------------------------------
 st.set_page_config(page_title="Leaf Disease Detection", layout="wide")
-st.title("🌿 Leaf Disease Detection")
+st.title("🌿 Leaf Disease Detection (joblib version)")
 
 st.markdown("""
-This app allows you to detect leaf diseases using a pre-trained model.
-- Upload single leaf images for prediction
-- Upload ZIP files for batch predictions
+Upload single leaf images or a ZIP of multiple images to predict leaf diseases.
 """)
 
 # --- SINGLE IMAGE UPLOADER ---
@@ -111,7 +123,6 @@ if batch_file is not None:
                         pred = predict_image(img)
                         results.append((file_name, pred))
 
-                # Display results
                 st.subheader("Batch Predictions")
                 for fname, pred in results:
                     st.write(f"**{fname}** → {pred}")
@@ -123,4 +134,4 @@ if batch_file is not None:
 # --- FOOTER ---
 # ------------------------------
 st.markdown("---")
-st.markdown("Leaf Disease Detector V1.1")
+st.markdown("|Leaf Disease Detector|")
