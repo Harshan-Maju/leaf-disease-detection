@@ -21,15 +21,20 @@ PIPELINE_PATH = "models/production_pipeline.joblib"  # optional
 METADATA_PATH = "models/metadata.json"
 METADATA_URL = "https://drive.google.com/uc?export=download&id=17QTd2spFzpcwX6o256Xegqjksvl5zI6t"
 
+# Model download URL (your Google Drive link)
+MODEL_URL = "https://drive.google.com/uc?id=1vdGvyehvrAWtvVTWM9G0Dq-sQh13Sp2k"
+
 # ------------------------------
-# --- DOWNLOAD METADATA IF MISSING ---
+# --- DOWNLOAD FILE IF MISSING ---
 # ------------------------------
 def download_file(url, path, description):
     if not os.path.exists(path):
         with st.spinner(f"📥 Downloading {description}..."):
             gdown.download(url, path, quiet=False)
 
+# Download metadata and model if missing
 download_file(METADATA_URL, METADATA_PATH, "metadata")
+download_file(MODEL_URL, MODEL_PATH, "leaf disease model")
 
 # ------------------------------
 # --- LOAD METADATA ---
