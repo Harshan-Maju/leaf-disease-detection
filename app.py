@@ -1,142 +1,230 @@
 import streamlit as st
-import os
-import json
-import joblib
+import torch
+from torchvision import models, transforms
 from PIL import Image
+import joblib
 import numpy as np
-import zipfile
-import gdown
+from pathlib import Path
+import pandas as pd
 
-# ------------------------------
-# --- CONFIGURATION / PATHS ---
-# ------------------------------
-os.makedirs("models", exist_ok=True)
+# ----------------------------
+# Paths and Config
+# ----------------------------
+FEATURE_DIR = Path(r"C:\Users\harsh\Documents\LeafDiseaseProject\feature_dataset_merged")
+BINARY_MODEL = FEATURE_DIR / "binary_model_rf.pkl"   # Random Forest (binary)
+MULTI_MODEL = FEATURE_DIR / "multi_model_rf.pkl"     # Random Forest (multi-class)
+MULTI_MAPPING = FEATURE_DIR / "multi_mapping.pkl"
 
-# Models (joblib)
-MODEL_PATH = "models/final_leaf_disease_model.joblib"
-PCA_PATH = "models/pca.joblib"  # optional if your pipeline needs PCA
-PIPELINE_PATH = "models/production_pipeline.joblib"  # optional
+DEFAULT_UNCERTAINTY = 0.55
+SHOW_UNCERTAIN = True
 
-# Metadata
-METADATA_PATH = "models/metadata.json"
-METADATA_URL = "https://drive.google.com/uc?export=download&id=17QTd2spFzpcwX6o256Xegqjksvl5zI6t"
+# ----------------------------
+# Helpers
+# ----------------------------
+def clamp_0_1(x):
+    x = float(x)
+    return max(0.0, min(1.0, x))
 
-# Model download URL (your Google Drive link)
-MODEL_URL = "https://drive.google.com/uc?id=1vdGvyehvrAWtvVTWM9G0Dq-sQh13Sp2k"
+# ----------------------------
+# Cached loaders
+# ----------------------------
+@st.cache_resource
+def load_models():
+    bin_clf = joblib.load(BINARY_MODEL)
+    multi_clf = joblib.load(MULTI_MODEL)
+    label_mapping = joblib.load(MULTI_MAPPING)
+    idx_to_label = {v: k for k, v in label_mapping.items()}
+    return bin_clf, multi_clf, idx_to_label
 
-# ------------------------------
-# --- DOWNLOAD FILE IF MISSING ---
-# ------------------------------
-def download_file(url, path, description):
-    if not os.path.exists(path):
-        with st.spinner(f"📥 Downloading {description}..."):
-            gdown.download(url, path, quiet=False)
+@st.cache_resource
+def load_feature_extractor():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = models.resnet50(pretrained=True)
+    model = torch.nn.Sequential(*(list(model.children())[:-1]))
+    model.eval()
+    model.to(device)
+    return model, device
 
-# Download metadata and model if missing
-download_file(METADATA_URL, METADATA_PATH, "metadata")
-download_file(MODEL_URL, MODEL_PATH, "leaf disease model")
+# ----------------------------
+# Transforms (must match training)
+# ----------------------------
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
 
-# ------------------------------
-# --- LOAD METADATA ---
-# ------------------------------
-with open(METADATA_PATH, "r") as f:
-    metadata = json.load(f)
+# ----------------------------
+# Utility functions
+# ----------------------------
+def extract_plant_name(class_name: str) -> str:
+    if '_' in class_name:
+        return class_name.split('_')[0].capitalize()
+    return class_name.capitalize()
 
-if "class_to_idx" not in metadata:
-    st.error("❌ metadata.json missing 'class_to_idx'")
-    st.stop()
+def extract_disease_name(class_name: str) -> str:
+    if '_healthy' in class_name.lower():
+        return "Healthy"
+    if '_' in class_name:
+        parts = class_name.split('_')[1:]
+        return ' '.join(parts).replace('_', ' ').title()
+    return class_name.title()
 
-class_names = {v: k for k, v in metadata["class_to_idx"].items()}
+def extract_features_single(image: Image.Image, model, device) -> np.ndarray:
+    x = transform(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+            feats = model(x)
+    return feats.squeeze(-1).squeeze(-1).cpu().numpy()
 
-# ------------------------------
-# --- LOAD MODEL ---
-# ------------------------------
-if not os.path.exists(MODEL_PATH):
-    st.error(f"Model file {MODEL_PATH} not found. Please upload it.")
-    st.stop()
+def predict_image(image, bin_clf, multi_clf, idx_to_label, feature_model, device, threshold, show_uncertain=True):
+    feats = extract_features_single(image, feature_model, device)
 
-model = joblib.load(MODEL_PATH)
-st.success("✅ Model loaded successfully!")
+    # Binary prediction
+    bin_proba = bin_clf.predict_proba(feats)[0]  # e.g. [prob_healthy, prob_diseased] depending on how trained
+    bin_pred = bin_clf.predict(feats)[0]
 
-# Optional: load PCA or pipeline if used
-# pca = joblib.load(PCA_PATH) if os.path.exists(PCA_PATH) else None
-# pipeline = joblib.load(PIPELINE_PATH) if os.path.exists(PIPELINE_PATH) else None
+    # Multi-class prediction
+    multi_proba = multi_clf.predict_proba(feats)[0]
+    multi_pred = multi_clf.predict(feats)[0]
+    multi_conf = float(np.max(multi_proba))
 
-# ------------------------------
-# --- IMAGE PREPROCESSING ---
-# ------------------------------
-def preprocess_image(image: Image.Image) -> np.ndarray:
-    """
-    Converts a PIL image into the format your joblib model expects.
-    For example, flatten and normalize.
-    Adjust this function based on your model's training pipeline.
-    """
-    image = image.resize((224, 224))  # or your trained size
-    arr = np.array(image).astype(np.float32)
-    arr = arr.flatten()  # flatten image
-    arr = arr.reshape(1, -1)
-    return arr
+    # Class names
+    full_class_name = idx_to_label[multi_pred]
+    plant_name = extract_plant_name(full_class_name)
 
-# ------------------------------
-# --- PREDICTION FUNCTION ---
-# ------------------------------
-def predict_image(image: Image.Image):
-    X = preprocess_image(image)
-    pred_idx = model.predict(X)[0]
-    # Map prediction index to class name
-    return class_names.get(pred_idx, f"Class {pred_idx}")
+    # Decide output
+    if show_uncertain and multi_conf < threshold:
+        status = "Uncertain"
+        disease_name = "N/A"
+        confidence = multi_conf
+        plant_out = "N/A"
+    else:
+        if bin_pred == 0:
+            status = "Healthy"
+            disease_name = "No disease detected"
+            # For Healthy, use binary-probability-of-healthy as main confidence
+            confidence = float(bin_proba[0])
+            plant_out = plant_name
+        else:
+            status = "Diseased"
+            disease_name = extract_disease_name(full_class_name)
+            # For Diseased, use the multi-class confidence (max of multi_proba)
+            confidence = multi_conf
+            plant_out = plant_name
 
-# ------------------------------
-# --- STREAMLIT UI ---
-# ------------------------------
-st.set_page_config(page_title="Leaf Disease Detection", layout="wide")
-st.title("🌿 Leaf Disease Detection (joblib version)")
+    return status, plant_out, disease_name, confidence
 
-st.markdown("""
-Upload single leaf images or a ZIP of multiple images to predict leaf diseases.
-""")
+# ----------------------------
+# UI
+# ----------------------------
+st.set_page_config(page_title="Leaf Disease Detection", page_icon="🍃", layout="wide")
+st.title("🍃 Leaf Disease Detection (Random Forest)")
 
-# --- SINGLE IMAGE UPLOADER ---
-st.header("Single Image Prediction")
-single_file = st.file_uploader("Upload a leaf image", type=["jpg", "jpeg", "png"], key="single")
+with st.spinner("Loading models and feature extractor..."):
+    bin_clf, multi_clf, idx_to_label = load_models()
+    feature_model, device = load_feature_extractor()
 
-if single_file is not None:
-    try:
-        image = Image.open(single_file).convert("RGB")
-        st.image(image, caption="Uploaded Image", use_column_width=True)
-        prediction = predict_image(image)
-        st.success(f"Prediction: **{prediction}**")
-    except Exception as e:
-        st.error(f"Error processing image: {e}")
+if torch.cuda.is_available():
+    st.success(f"✅ GPU enabled: {torch.cuda.get_device_name(0)}")
+else:
+    st.info("ℹ️ Running on CPU")
 
-# --- BATCH IMAGE UPLOADER ---
-st.header("Batch Prediction (ZIP)")
-batch_file = st.file_uploader("Upload a ZIP of leaf images", type=["zip"], key="batch")
+# Sidebar
+st.sidebar.header("Settings")
+threshold = st.sidebar.slider("Uncertainty Threshold", 0.0, 1.0, DEFAULT_UNCERTAINTY, 0.05)
+show_uncertain = st.sidebar.checkbox("Enable Uncertain status", value=SHOW_UNCERTAIN)
+st.sidebar.caption(f"Current threshold: {threshold:.2f}")
+st.sidebar.markdown("---")
+st.sidebar.info("This app uses ResNet50 feature extraction and calibrated Random Forest classifiers.")
 
-if batch_file is not None:
-    try:
-        with zipfile.ZipFile(batch_file) as z:
-            image_files = [f for f in z.namelist() if f.lower().endswith((".jpg", ".jpeg", ".png"))]
-            if not image_files:
-                st.warning("No valid image files found in ZIP.")
+# Tabs
+tab1, tab2 = st.tabs(["📷 Single Image Upload", "📁 Batch Upload"])
+
+# ----------------------------
+# Single Image Upload
+# ----------------------------
+with tab1:
+    st.subheader("Single Image")
+    single_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"], key="single")
+    if single_file:
+        image = Image.open(single_file).convert('RGB')
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            st.image(image, caption=single_file.name, use_container_width=True)
+
+        with col2:
+            with st.spinner("Analyzing image..."):
+                status, plant, disease, conf = predict_image(
+                    image, bin_clf, multi_clf, idx_to_label, feature_model, device,
+                    threshold=threshold, show_uncertain=show_uncertain
+                )
+
+            st.subheader("Analysis Results")
+            if status == "Uncertain":
+                st.warning(f"⚠️ Status: {status}")
+            elif status == "Healthy":
+                st.success(f"✅ Status: {status}")
             else:
-                st.info(f"Found {len(image_files)} images. Processing...")
-                results = []
-                for file_name in image_files:
-                    with z.open(file_name) as f:
-                        img = Image.open(f).convert("RGB")
-                        pred = predict_image(img)
-                        results.append((file_name, pred))
+                st.error(f"🦠 Status: {status}")
 
-                st.subheader("Batch Predictions")
-                for fname, pred in results:
-                    st.write(f"**{fname}** → {pred}")
+            st.markdown(f"• Plant: {plant}")
+            st.markdown(f"• Disease: {disease}")
+            st.markdown(f"• Confidence: {conf:.2%}")
 
-    except Exception as e:
-        st.error(f"Error processing ZIP: {e}")
+            # progress expects 0..1 so clamp just in case
+            st.progress(clamp_0_1(conf))
 
-# ------------------------------
-# --- FOOTER ---
-# ------------------------------
-st.markdown("---")
-st.markdown("|Leaf Disease Detector|")
+# ----------------------------
+# Batch Upload
+# ----------------------------
+with tab2:
+    st.subheader("Batch Images")
+    batch_files = st.file_uploader("Choose multiple images", type=["jpg", "jpeg", "png"],
+                                   accept_multiple_files=True, key="batch")
+    if batch_files:
+        results = []
+        cols = st.columns(3)
+
+        for i, f in enumerate(batch_files):
+            img = Image.open(f).convert('RGB')
+            with st.spinner(f"Analyzing {f.name}..."):
+                status, plant, disease, conf = predict_image(
+                    img, bin_clf, multi_clf, idx_to_label, feature_model, device,
+                    threshold=threshold, show_uncertain=show_uncertain
+                )
+
+            with cols[i % 3]:
+                st.image(img, caption=f.name, use_container_width=True)
+                if status == "Uncertain":
+                    st.warning(f"⚠️ {status}")
+                elif status == "Healthy":
+                    st.success(f"✅ {status}")
+                else:
+                    st.error(f"🦠 {status}")
+
+                st.caption(f"Plant: {plant}")
+                st.caption(f"Disease: {disease}")
+                st.caption(f"Confidence: {conf:.2%}")
+
+            results.append({
+                "Filename": f.name,
+                "Status": status,
+                "Plant": plant,
+                "Disease": disease,
+                "Confidence": f"{conf:.2%}"
+            })
+
+        st.markdown("---")
+        st.subheader("Results Summary")
+        df_out = pd.DataFrame(results)
+        st.dataframe(df_out, use_container_width=True)
+        st.download_button(
+            label="📥 Download Results CSV",
+            data=df_out.to_csv(index=False).encode('utf-8'),
+            file_name="leaf_disease_results_rf.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("Upload multiple images to start batch analysis")
